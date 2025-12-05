@@ -1,0 +1,131 @@
+# @rewrite0/typed-worker
+
+一个类型安全的 Web Worker 包装器，提供简洁的 API 和完整的 TypeScript 支持。
+
+## 特性
+
+- 🔒 **类型安全** - 完整的 TypeScript 类型推导和校验
+- 🚀 **简单易用** - 简洁直观的 API 设计
+- 🔄 **并发支持** - 能够正确处理并发任务，确保输入输出的一致性
+- ⚡ **懒加载** - Worker 只在第一次调用时初始化
+- 📦 **轻量级** - 零依赖
+- 🛡️ **错误处理** - 完整的错误处理
+- 📤 **Transferable 对象** - 支持数据所有权转移
+- 🔧 **优雅关闭** - 等待所有未完成任务后安全关闭 Worker，关闭期间拒绝新任务
+
+## 安装
+
+```bash
+npm install @rewrite0/typed-worker
+```
+
+或使用 pnpm：
+
+```bash
+pnpm add @rewrite0/typed-worker
+```
+
+## 使用案例
+
+### 1. 定义 Worker 操作
+
+首先创建一个 worker 文件 (`worker.ts`)：
+
+```typescript
+import { defineWorkerActions, setupWorkerActions } from '@rewrite0/typed-worker';
+
+const actions = defineWorkerActions({
+  async add(a: number, b: number) {
+    return a + b;
+  },
+  async processData(data: string) {
+    // 模拟重计算任务
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    return data.toUpperCase();
+  },
+  async transferBuffer(buffer: ArrayBuffer) {
+    // 处理 ArrayBuffer
+    return buffer.byteLength;
+  },
+  async riskyOperation() {
+    throw new Error('Something went wrong');
+  },
+  async longTimeTask(duration: number) {
+    return new Promise<number>((resolve) => {
+      setTimeout(() => {
+        resolve(duration);
+      }, duration);
+    });
+  },
+});
+
+setupWorkerActions(actions);
+
+// 导出类型以供主线程使用
+export type Actions = typeof actions;
+```
+
+### 2. 在主线程中使用
+
+```typescript
+import { createTypedWorker } from '@rewrite0/typed-worker';
+import Worker from './worker?worker'; // Vite 风格导入
+import type { Actions } from './worker'; // 导入类型
+
+// 创建类型安全的 worker 实例
+const worker = createTypedWorker<Actions>(() => new Worker());
+
+// 第一次调用时才会创建和初始化 Worker 实例
+const result = await worker.add(1, 2); // Worker 在此时创建
+
+// 直接调用方法 - 完整的类型推导
+const result1 = await worker.add(2, 3); // number
+const result2 = await worker.processData('hello'); // string
+
+// action抛出的错误会被正常catch
+try {
+  await worker.riskyOperation();
+} catch (error) {
+  console.error(error.message); // "Something went wrong"
+}
+
+// 使用 call 方法进行所有权转移（Transferable）
+const buffer = new ArrayBuffer(16);
+console.log(buffer.byteLength) // 16
+await worker.call('transferBuffer', [buffer])(buffer);
+console.log(buffer.byteLength); // 0 - buffer 已被转移
+
+// 如果不需要所有权转移，直接调用方法
+const buffer2 = new ArrayBuffer(1024 * 1024);
+await worker.transferBuffer(buffer2);
+console.log(buffer2.byteLength); // 1048576 - buffer 仍然可用
+
+// 正确处理多个并发任务
+const tasks = Array.from({ length: 100 }, (_, i) =>
+  worker.add(i, 1)
+);
+
+const results = await Promise.all(tasks);
+console.log(results); // [1, 2, 3, ..., 100]
+
+// 优雅关闭 worker (会等待所有未完成任务完毕后关闭, 在关闭等待期间，任何新的任务请求都会被直接拒绝)
+// 启动一些任务
+const task1 = worker.longTimeTask(1000);
+const task2 = worker.anotherTask(1500);
+
+// 开始关闭流程
+const terminatePromise = worker.terminate();
+
+// 在关闭等待期间尝试添加新任务会被拒绝
+try {
+  await worker.add(1, 2); // 抛出错误：Worker is terminating
+} catch (error) {
+  console.log(error.message); // "Worker is terminating, cannot accept new tasks"
+}
+
+// 正常完成任务
+console.log(await task1) // 1000
+console.log(await task2) // 1500
+await terminatePromise // 等待关闭
+console.log('ok') // ok
+```

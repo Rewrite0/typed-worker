@@ -1,0 +1,231 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - "v*.*.*" # 匹配 v1.0.0, v2.1.3 等格式的标签
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        id: playwright-cache
+        with:
+          path: |
+            ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('**/pnpm-lock.yaml') }}
+
+      - name: Install playwright
+        run: pnpm playwright install --with-deps
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+
+      - name: Install playwright dependencies only
+        run: pnpm playwright install-deps
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+
+      - name: Run test
+        run: pnpm test
+
+      - name: Build
+        run: pnpm build
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-files
+          path: |
+            dist/
+            package.json
+            pnpm-lock.yaml
+          retention-days: 1
+
+  release:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v') # 只在推送版本标签时执行
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # 需要写入权限来创建 GitHub Release
+      id-token: write # 用于 npm 发布的身份验证
+    # 注意：需要在 GitHub 仓库设置的 Secrets 中添加 NPM_TOKEN
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 获取完整的 git 历史用于 changelog
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-files
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Get version from tag
+        id: get_version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Verify package version
+        run: |
+          PACKAGE_VERSION=$(node -p "require('./package.json').version")
+          if [ "$PACKAGE_VERSION" != "${{ steps.get_version.outputs.VERSION }}" ]; then
+            echo "Error: Package version ($PACKAGE_VERSION) does not match tag version (${{ steps.get_version.outputs.VERSION }})"
+            exit 1
+          fi
+
+      - name: Publish to npm
+        run: pnpm publish --access public --no-git-checks
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Generate changelog from commits
+        id: changelog
+        run: |
+          # 获取上一个标签
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          echo "PREV_TAG=$PREV_TAG" >> $GITHUB_ENV
+
+          if [ -z "$PREV_TAG" ]; then
+            # 如果没有上一个标签，获取所有提交
+            COMMITS=$(git log --pretty=format:"%s" --reverse)
+          else
+            # 获取两个标签之间的提交
+            COMMITS=$(git log --pretty=format:"%s" ${PREV_TAG}..HEAD --reverse)
+          fi
+
+          # 分类整理提交信息
+          FEATURES=""
+          FIXES=""
+          BREAKING=""
+          DOCS=""
+          CHORES=""
+          OTHERS=""
+
+          while IFS= read -r commit; do
+            if [[ -z "$commit" ]]; then
+              continue
+            fi
+
+            # 根据 conventional commits 格式分类
+            case "$commit" in
+              feat*)
+                FEATURES="${FEATURES}- ${commit#feat*: }"$'\n'
+                ;;
+              fix*)
+                FIXES="${FIXES}- ${commit#fix*: }"$'\n'
+                ;;
+              *"BREAKING CHANGE"* | *"!"*)
+                BREAKING="${BREAKING}- ${commit}"$'\n'
+                ;;
+              docs*)
+                DOCS="${DOCS}- ${commit#docs*: }"$'\n'
+                ;;
+              chore* | build* | ci* | test*)
+                CHORES="${CHORES}- ${commit#*: }"$'\n'
+                ;;
+              *)
+                OTHERS="${OTHERS}- ${commit}"$'\n'
+                ;;
+            esac
+          done <<< "$COMMITS"
+
+          # 构建 changelog
+          CHANGELOG=""
+
+          if [ -n "$BREAKING" ]; then
+            CHANGELOG="${CHANGELOG}### 💥 Breaking Changes"$'\n'"${BREAKING}"$'\n'
+          fi
+
+          if [ -n "$FEATURES" ]; then
+            CHANGELOG="${CHANGELOG}### ✨ Features"$'\n'"${FEATURES}"$'\n'
+          fi
+
+          if [ -n "$FIXES" ]; then
+            CHANGELOG="${CHANGELOG}### 🐛 Bug Fixes"$'\n'"${FIXES}"$'\n'
+          fi
+
+          if [ -n "$DOCS" ]; then
+            CHANGELOG="${CHANGELOG}### 📚 Documentation"$'\n'"${DOCS}"$'\n'
+          fi
+
+          if [ -n "$CHORES" ]; then
+            CHANGELOG="${CHANGELOG}### 🔧 Maintenance"$'\n'"${CHORES}"$'\n'
+          fi
+
+          if [ -n "$OTHERS" ]; then
+            CHANGELOG="${CHANGELOG}### 📝 Other Changes"$'\n'"${OTHERS}"$'\n'
+          fi
+
+          # 如果没有分类的提交，显示默认消息
+          if [ -z "$CHANGELOG" ]; then
+            CHANGELOG="### 📝 Changes"$'\n'"- Various improvements and updates"$'\n'
+          fi
+
+          # 使用 heredoc 方式处理多行输出
+          {
+            echo 'CHANGELOG<<EOF'
+            echo "$CHANGELOG"
+            echo 'EOF'
+          } >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: Release v${{ steps.get_version.outputs.VERSION }}
+          body: |
+            ## 🚀 What's Changed in v${{ steps.get_version.outputs.VERSION }}
+
+            ${{ steps.changelog.outputs.CHANGELOG }}
+
+            ### 📦 Installation
+
+            ```bash
+            npm install @rewrite0/typed-worker@${{ steps.get_version.outputs.VERSION }}
+            ```
+
+            ```bash
+            pnpm add @rewrite0/typed-worker@${{ steps.get_version.outputs.VERSION }}
+            ```
+
+            ### 🔗 Links
+
+            - [📦 NPM Package](https://www.npmjs.com/package/@rewrite0/typed-worker/v/${{ steps.get_version.outputs.VERSION }})
+            - [📋 Full Changelog](https://github.com/${{ github.repository }}/commits/v${{ steps.get_version.outputs.VERSION }})
+          draft: false
+          prerelease: ${{ contains(steps.get_version.outputs.VERSION, '-') }}
+
+      - name: Release completed
+        if: success()
+        run: |
+          echo "✅ Successfully completed release for v${{ steps.get_version.outputs.VERSION }}"
+          echo "📦 Package info: @rewrite0/typed-worker@${{ steps.get_version.outputs.VERSION }}"
+          echo "📋 Generated changelog with ${{ steps.changelog.outputs.CHANGELOG != '' && 'custom' || 'default' }} content"
+          echo "🚀 Release published to npm and GitHub!"
