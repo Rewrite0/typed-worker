@@ -111,7 +111,7 @@ console.log(results); // [1, 2, 3, ..., 100]
 // 优雅关闭 worker (会等待所有未完成任务完毕后关闭, 在关闭等待期间，任何新的任务请求都会被直接拒绝)
 // 启动一些任务
 const task1 = worker.longTimeTask(1000);
-const task2 = worker.anotherTask(1500);
+const task2 = worker.longTimeTask(1500);
 
 // 开始关闭流程
 const terminatePromise = worker.terminate();

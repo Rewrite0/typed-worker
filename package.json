@@ -3,11 +3,20 @@
   "version": "0.0.2",
   "author": "Rewrite0",
   "repository": "https://github.com/rewrite0/typed-worker",
+  "keywords": [
+    "worker",
+    "web-worker",
+    "typescript",
+    "type-safe",
+    "typed",
+    "async",
+    "promise",
+    "transferable"
+  ],
   "type": "module",
   "main": "./dist/index.js",
   "files": [
-    "dist",
-    "README.md"
+    "dist"
   ],
   "exports": {
     ".": {
