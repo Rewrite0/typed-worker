@@ -1,11 +1,11 @@
 import Worker from './worker?worker';
-import type { Actions } from './worker';
+import type { Actions, Events } from './worker';
 import { describe, test, expect } from 'vitest';
 import { createTypedWorker } from '../src/index';
 
-const worker = createTypedWorker<Actions>(() => new Worker());
+const worker = createTypedWorker<Actions, Events>(() => new Worker());
 
-describe('Typed Worker', () => {
+describe('Typed Worker', async () => {
   test('should handle multiple concurrent calls correctly', async () => {
     const tasks = Array.from({ length: 100 }, (_, i) => worker.add(i, 1).then((r) => r === i + 1));
     const results = await Promise.all(tasks);
@@ -56,19 +56,88 @@ describe('Typed Worker', () => {
   });
 
   test('should handle pending tasks on termination', async () => {
-    const task1 = worker.longTimeTask(1000);
-    const task2 = worker.longTimeTask(1500);
+    const task1 = worker.longTimeTask(500);
+    const task2 = worker.longTimeTask(800);
 
     const terminatePromise = worker.terminate();
 
     const result1 = await task1;
-    expect(result1).toBe('Waited for 1000 ms');
+    expect(result1).toBe('Waited for 500 ms');
 
     const result2 = await task2;
-    expect(result2).toBe('Waited for 1500 ms');
+    expect(result2).toBe('Waited for 800 ms');
 
     await terminatePromise;
     // If we reach here, it means termination waited for pending tasks
     expect(true).toBe(true);
   });
+
+  test('should emit and receive events from worker', async () => {
+    let count = 0;
+    await new Promise<string>((resolve) => {
+      const off = worker.onWSE('heartbeat', (payload) => {
+        expect(payload).toBe('ping');
+        count++;
+        if (count === 3) {
+          off();
+          resolve(payload);
+        }
+      });
+    });
+
+    expect(count).toBe(3);
+  });
+
+  test('should remove event listener correctly', async () => {
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+    let count = 0;
+    const handler = () => {
+      count++;
+    };
+    worker.onWSE('heartbeat', handler);
+
+    // Wait for some events
+    await sleep(500);
+    expect(count).toBeGreaterThan(0);
+
+    worker.offWSE('heartbeat', handler);
+    const prevCount = count;
+
+    // Wait more to see if count increases
+    await sleep(500);
+    expect(count).toBe(prevCount);
+  });
+
+  test('should clear all event listeners', async () => {
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+    let count = 0;
+    let count2 = 0;
+    const off = worker.onWSE('heartbeat', () => {
+      count++;
+    });
+    const off2 = worker.onWSE('heartbeat', () => {
+      count2++;
+    });
+
+    // Wait for some events
+    await sleep(500);
+    expect(count).toBeGreaterThan(0);
+    expect(count2).toBeGreaterThan(0);
+
+    worker.clearWSE();
+    const prevCount = count;
+    const prevCount2 = count2;
+
+    // Wait more to see if count increases
+    await sleep(500);
+    expect(count).toBe(prevCount);
+    expect(count2).toBe(prevCount2);
+
+    off(); // just to be safe
+    off2();
+  });
+
+  await worker.terminate();
 });
