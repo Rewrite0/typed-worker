@@ -1,11 +1,13 @@
 import Worker from './worker?worker';
-import type { Actions, Events } from './worker';
+import type { Actions } from './worker';
 import { describe, test, expect } from 'vitest';
 import { createTypedWorker } from '../src/index';
 
-const worker = createTypedWorker<Actions, Events>(() => new Worker());
+const worker = createTypedWorker<Actions>(() => new Worker());
 
-describe('Typed Worker', async () => {
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+describe('Typed Worker', () => {
   test('should handle multiple concurrent calls correctly', async () => {
     const tasks = Array.from({ length: 100 }, (_, i) => worker.add(i, 1).then((r) => r === i + 1));
     const results = await Promise.all(tasks);
@@ -56,88 +58,127 @@ describe('Typed Worker', async () => {
   });
 
   test('should handle pending tasks on termination', async () => {
-    const task1 = worker.longTimeTask(500);
-    const task2 = worker.longTimeTask(800);
+    const task1 = worker.longTimeTask(1000);
+    const task2 = worker.longTimeTask(1500);
 
     const terminatePromise = worker.terminate();
 
     const result1 = await task1;
-    expect(result1).toBe('Waited for 500 ms');
+    expect(result1).toBe('Waited for 1000 ms');
 
     const result2 = await task2;
-    expect(result2).toBe('Waited for 800 ms');
+    expect(result2).toBe('Waited for 1500 ms');
 
     await terminatePromise;
     // If we reach here, it means termination waited for pending tasks
     expect(true).toBe(true);
   });
 
-  test('should emit and receive events from worker', async () => {
-    let count = 0;
-    await new Promise<string>((resolve) => {
-      const off = worker.onWSE('heartbeat', (payload) => {
-        expect(payload).toBe('ping');
-        count++;
-        if (count === 3) {
-          off();
-          resolve(payload);
-        }
-      });
+  test('should handle event listeners with onEvent', async () => {
+    let countValue = -1;
+    let pingReceived = false;
+
+    const countUnsubscribe = worker.onEvent('count', (value) => {
+      countValue = value;
     });
 
-    expect(count).toBe(3);
+    const pingUnsubscribe = worker.onEvent('ping', () => {
+      pingReceived = true;
+    });
+
+    // Wait for events to be emitted
+    await sleep(250);
+
+    expect(countValue).toBeGreaterThanOrEqual(0);
+    expect(pingReceived).toBe(true);
+
+    countUnsubscribe();
+    pingUnsubscribe();
   });
 
-  test('should remove event listener correctly', async () => {
-    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  test('should remove specific event listener with offEvent', async () => {
+    let count1 = -1;
+    let count2 = -1;
 
-    let count = 0;
-    const handler = () => {
-      count++;
+    const handler1 = (value: number) => {
+      count1 = value;
     };
-    worker.onWSE('heartbeat', handler);
+    const handler2 = (value: number) => {
+      count2 = value;
+    };
 
-    // Wait for some events
-    await sleep(500);
-    expect(count).toBeGreaterThan(0);
+    worker.onEvent('count', handler1);
+    worker.onEvent('count', handler2);
 
-    worker.offWSE('heartbeat', handler);
-    const prevCount = count;
+    // Wait for events
+    await sleep(150);
 
-    // Wait more to see if count increases
-    await sleep(500);
-    expect(count).toBe(prevCount);
+    const firstValue2 = count2;
+
+    // Remove only handler1
+    worker.offEvent('count', handler1);
+
+    // Reset and wait for more events
+    count1 = -1;
+    count2 = -1;
+    await sleep(150);
+
+    expect(count1).toBe(-1); // Should not have changed
+    expect(count2).toBeGreaterThan(firstValue2); // Should have updated
+
+    worker.offEvent('count', handler2);
   });
 
-  test('should clear all event listeners', async () => {
-    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  test('should clear all event listeners with clearEvents', async () => {
+    let countReceived = false;
+    let pingReceived = false;
 
-    let count = 0;
-    let count2 = 0;
-    const off = worker.onWSE('heartbeat', () => {
-      count++;
+    worker.onEvent('count', () => {
+      countReceived = true;
     });
-    const off2 = worker.onWSE('heartbeat', () => {
-      count2++;
+    worker.onEvent('ping', () => {
+      pingReceived = true;
     });
 
-    // Wait for some events
-    await sleep(500);
-    expect(count).toBeGreaterThan(0);
-    expect(count2).toBeGreaterThan(0);
+    // Wait for events
+    await sleep(150);
 
-    worker.clearWSE();
-    const prevCount = count;
-    const prevCount2 = count2;
+    expect(countReceived).toBe(true);
+    expect(pingReceived).toBe(true);
 
-    // Wait more to see if count increases
-    await sleep(500);
-    expect(count).toBe(prevCount);
-    expect(count2).toBe(prevCount2);
+    // Clear all events and reset flags
+    worker.clearEvents();
+    countReceived = false;
+    pingReceived = false;
 
-    off(); // just to be safe
-    off2();
+    // Wait again
+    await sleep(150);
+
+    expect(countReceived).toBe(false);
+    expect(pingReceived).toBe(false);
   });
 
-  await worker.terminate();
+  test('should handle multiple listeners for the same event', async () => {
+    const values: number[] = [];
+    const moreValues: number[] = [];
+
+    worker.onEvent('count', (value) => values.push(value));
+    worker.onEvent('count', (value) => moreValues.push(value * 2));
+
+    await sleep(250);
+
+    expect(values.length).toBeGreaterThan(0);
+    expect(moreValues.length).toBe(values.length);
+    expect(moreValues[0]).toBe(values[0] * 2);
+
+    worker.clearEvents();
+  });
+
+  test('should handle event listener removal that does not exist', () => {
+    const handler = () => {};
+
+    // Should not throw when removing non-existent handler
+    expect(() => worker.offEvent('count', handler)).not.toThrow();
+    expect(() => worker.offEvent('nonexistent' as any, handler)).not.toThrow();
+  });
 });

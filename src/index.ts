@@ -1,13 +1,6 @@
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type WorkerActions = Record<string, (...args: any[]) => Promise<unknown>>;
-
-export type WorkerSentEvents = Record<string, unknown>;
-
-export type WorkerSentEventMessage = {
-  type: 'worker-sent-event';
-  name: string;
-  payload: unknown;
-};
+export type WorkerEvents = Record<string, any[]>;
 
 export type MainMessage = {
   id: number;
@@ -15,23 +8,25 @@ export type MainMessage = {
   args: unknown[];
 };
 
-export type WorkerMessage = {
-  id: number;
-  name: string;
-  payload: unknown;
-  error?: boolean;
-};
+export type WorkerMessage =
+  | {
+      id: number;
+      name: string;
+      payload: unknown;
+      error?: boolean;
+    }
+  | {
+      type: 'worker-send-event';
+      name: string;
+      payload: unknown[];
+    };
 
-export function createTypedWorker<
-  T extends WorkerActions,
-  E extends WorkerSentEvents = WorkerSentEvents
->(setupWorker: () => Worker) {
-  let id = 0;
-  const generateId = () => ++id;
+export function createTypedWorker<T extends WorkerActions, E extends WorkerEvents = WorkerEvents>(
+  setupWorker: () => Worker
+) {
   let worker: Worker | null = null;
   let terminateResolve: (() => void) | null = null;
   let terminatePromise: Promise<void> | null = null;
-  // worker action queue
   const queue = new Map<
     number,
     {
@@ -40,8 +35,9 @@ export function createTypedWorker<
       reject: (reason?: unknown) => void;
     }
   >();
-  // worker sent event handles
-  const handles = new Map<string, Set<(payload: unknown) => void>>();
+  const eventListeners = new Map<keyof E, Set<(...args: any[]) => void>>();
+  let id = 0;
+  const generateId = () => ++id;
 
   const getWorker = () => {
     if (worker === null) {
@@ -87,21 +83,17 @@ export function createTypedWorker<
   function handleMessage(e: MessageEvent<WorkerMessage>) {
     const data = e.data;
 
-    if ('type' in data && data.type === 'worker-sent-event' && handles.has(data.name)) {
-      // 处理 Worker 发送的事件
-      const eventHandles = handles.get(data.name)!;
-      Promise.all(
-        Array.from(eventHandles).map((handle) => {
-          try {
-            handle(data.payload);
-          } catch (error) {
-            console.error(`Error in event handler for "${data.name}":`, error);
-          }
-        })
-      );
+    // 处理event消息
+    if ('type' in data) {
+      if (data.type !== 'worker-send-event' || !eventListeners.has(data.name)) return;
+      const listeners = eventListeners.get(data.name)!;
+      listeners.forEach((listener) => {
+        listener(...data.payload);
+      });
       return;
     }
 
+    // 处理 action 消息
     if (!queue.has(data.id)) return;
 
     const { resolve, reject } = queue.get(data.id)!;
@@ -111,17 +103,16 @@ export function createTypedWorker<
     onTaskComplete();
   }
 
-  async function handleError(e: ErrorEvent | MessageEvent) {
+  function handleError(e: ErrorEvent | MessageEvent) {
     console.error('Worker encountered an error', e);
-    await Promise.all(Array.from(queue.values()).map(({ reject }) => reject(e)));
+    queue.forEach(({ reject }) => {
+      reject(e);
+    });
     queue.clear();
 
     onTaskComplete();
   }
 
-  /**
-   * graceful terminate worker
-   */
   async function terminate(): Promise<void> {
     if (worker === null) return;
     // 如果已经在终止过程中，返回现有的 Promise
@@ -138,17 +129,6 @@ export function createTypedWorker<
     return terminatePromise;
   }
 
-  /**
-   * call worker action
-   * @param name action name
-   * @param transfer [option] transferable objects
-   * @example
-   * ```ts
-   * const buffer = new ArrayBuffer(1024);
-   * await worker.call('processData', [buffer])(data, buffer);
-   * console.log(buffer.byteLength); // 0 - buffer has been transferred
-   * ```
-   */
   function call<N extends keyof T>(name: N, transfer?: Transferable[]) {
     const worker = getWorker();
     return (...args: Parameters<T[N]>) =>
@@ -173,40 +153,53 @@ export function createTypedWorker<
   }
 
   /**
-   * listen to worker sent events
+   * 移除指定事件的监听器
    * @param name event name
-   * @param handler event handler
+   * @param listener event listener
    */
-  function onWSE<N extends keyof E>(name: N, handler: (payload: E[N]) => void) {
-    // ensure worker is created
+  function offEvent<N extends keyof E>(name: N, listener: (...args: E[N]) => void) {
+    if (!eventListeners.has(name)) return;
+    eventListeners.get(name)!.delete(listener);
+  }
+  /**
+   * 监听worker推送的事件
+   * @param name event name
+   * @param listener event listener
+   * @returns 用于移除监听器的函数
+   */
+  function onEvent<N extends keyof E>(name: N, listener: (...args: E[N]) => void) {
     getWorker();
-
-    if (!handles.has(name as string)) {
-      handles.set(name as string, new Set());
+    if (!eventListeners.has(name)) {
+      eventListeners.set(name, new Set());
     }
-    const eventHandles = handles.get(name as string)!;
-    eventHandles.add(handler as (payload: unknown) => void);
+    eventListeners.get(name)!.add(listener);
 
-    return () => offWSE(name, handler);
+    return () => offEvent(name, listener);
   }
 
-  function offWSE<N extends keyof E>(name: N, handler: (payload: E[N]) => void) {
-    if (!handles.has(name as string)) return;
-    const eventHandles = handles.get(name as string)!;
-    eventHandles.delete(handler as (payload: unknown) => void);
-  }
-
-  /** clear all worker sent event listeners */
-  function clearWSE() {
-    handles.clear();
+  /**
+   * 清除指定事件的所有监听器
+   * @param name event name
+   */
+  function clearEvents<N extends keyof E>(name: N): void;
+  /**
+   * 清除所有事件的所有监听器
+   */
+  function clearEvents(): void;
+  function clearEvents<N extends keyof E>(name?: N): void {
+    if (name !== void 0) {
+      eventListeners.delete(name);
+    } else {
+      eventListeners.clear();
+    }
   }
 
   const result = {} as T & {
     terminate: typeof terminate;
     call: typeof call;
-    onWSE: typeof onWSE;
-    offWSE: typeof offWSE;
-    clearWSE: typeof clearWSE;
+    onEvent: typeof onEvent;
+    offEvent: typeof offEvent;
+    clearEvents: typeof clearEvents;
   };
   return new Proxy(result, {
     get(_, prop) {
@@ -215,13 +208,12 @@ export function createTypedWorker<
           return terminate;
         case 'call':
           return call;
-        case 'onWSE':
-          return onWSE;
-        case 'offWSE':
-          return offWSE;
-        case 'clearWSE':
-          return clearWSE;
-
+        case 'onEvent':
+          return onEvent;
+        case 'offEvent':
+          return offEvent;
+        case 'clearEvents':
+          return clearEvents;
         default:
           return call(prop as keyof T);
       }
@@ -273,14 +265,14 @@ export function setupWorkerActions<T extends WorkerActions>(actions: T) {
   });
 }
 
-export function setupWorkerSentEvent<T extends WorkerSentEvents>() {
-  function emit<N extends keyof T, R = T[N]>(name: N, payload: R) {
+export function defineWorkerSendEvent<T extends WorkerEvents>() {
+  async function sender<N extends keyof T>(name: N, ...payload: T[N]) {
     globalThis.postMessage({
-      type: 'worker-sent-event',
+      type: 'worker-send-event',
       name,
       payload,
-    } as WorkerSentEventMessage);
+    });
   }
 
-  return emit;
+  return sender;
 }

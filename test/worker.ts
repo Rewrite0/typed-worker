@@ -1,4 +1,4 @@
-import { defineWorkerActions, setupWorkerActions, setupWorkerSentEvent } from '../src/index';
+import { defineWorkerActions, setupWorkerActions, defineWorkerSendEvent } from '../src/index';
 
 const actions = defineWorkerActions({
   async add(a: number, b: number) {
@@ -27,11 +27,15 @@ setupWorkerActions(actions);
 export type Actions = typeof actions;
 
 export type Events = {
-  heartbeat: 'ping';
+  count: [value: number];
+  ping: [];
 };
 
-const emit = setupWorkerSentEvent<Events>();
+const sender = defineWorkerSendEvent<Events>();
+
+let count = 0;
 
 setInterval(() => {
-  emit('heartbeat', 'ping');
-}, 200);
+  sender('count', count++);
+  sender('ping');
+}, 100);
