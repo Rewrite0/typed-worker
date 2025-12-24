@@ -12,6 +12,8 @@
 - 🛡️ **错误处理** - 完整的错误处理
 - 📤 **Transferable 对象** - 支持数据所有权转移
 - 🔧 **优雅关闭** - 等待所有未完成任务后安全关闭 Worker，关闭期间拒绝新任务
+- 📡 **事件监听** - 支持监听 Worker 主动向主线程推送的事件
+- 🎯 **事件管理** - 完整的事件监听器管理，支持添加、移除和清理
 
 ## 安装
 
@@ -32,7 +34,21 @@ pnpm add @rewrite0/typed-worker
 首先创建一个 worker 文件 (`worker.ts`)：
 
 ```typescript
-import { defineWorkerActions, setupWorkerActions } from '@rewrite0/typed-worker';
+import { defineWorkerActions, setupWorkerActions, defineWorkerSendEvent } from '@rewrite0/typed-worker';
+
+// 定义事件类型并导出
+export type Events = {
+  progress: [percent: number, message: string];
+  status: [status: 'idle' | 'working' | 'completed'];
+  notification: [message: string];
+  ping: [];
+};
+
+// 定义事件发送方法
+const sender = defineWorkerSendEvent<Events>();
+
+// 定期发送心跳事件
+setInterval(() => sender('ping'), 2000);
 
 const actions = defineWorkerActions({
   async add(a: number, b: number) {
@@ -51,11 +67,21 @@ const actions = defineWorkerActions({
     throw new Error('Something went wrong');
   },
   async longTimeTask(duration: number) {
-    return new Promise<number>((resolve) => {
-      setTimeout(() => {
-        resolve(duration);
-      }, duration);
-    });
+    const sender = defineWorkerSendEvent<Events>();
+
+    // 发送开始状态
+    sender('status', 'working');
+    sender('progress', 0, '开始任务...');
+
+    // 模拟任务进度
+    for (let i = 0; i <= 100; i += 25) {
+      await new Promise(resolve => setTimeout(resolve, duration / 4));
+      sender('progress', i, `进度: ${i}%`);
+    }
+
+    sender('status', 'completed');
+    sender('notification', '任务完成！');
+    return duration;
   },
 });
 
@@ -70,10 +96,10 @@ export type Actions = typeof actions;
 ```typescript
 import { createTypedWorker } from '@rewrite0/typed-worker';
 import Worker from './worker?worker'; // Vite 风格导入
-import type { Actions } from './worker'; // 导入类型
+import type { Actions, Events } from './worker'; // 导入类型
 
-// 创建类型安全的 worker 实例
-const worker = createTypedWorker<Actions>(() => new Worker());
+// 创建类型安全的 worker 实例，支持事件监听
+const worker = createTypedWorker<Actions, Events>(() => new Worker());
 
 // 第一次调用时才会创建和初始化 Worker 实例
 const result = await worker.add(1, 2); // Worker 在此时创建
@@ -128,4 +154,55 @@ console.log(await task1) // 1000
 console.log(await task2) // 1500
 await terminatePromise // 等待关闭
 console.log('ok') // ok
+
+// 事件监听使用示例
+// 监听任务进度
+const unsubscribeProgress = worker.onEvent('progress', (percent, message) => {
+  console.log(`${percent}%: ${message}`);
+});
+
+// 监听状态变化
+worker.onEvent('status', (status) => {
+  console.log(`状态变更: ${status}`);
+});
+
+// 监听通知消息
+worker.onEvent('notification', (message) => {
+  console.log(`通知: ${message}`);
+});
+
+// 监听心跳事件
+let heartbeatCount = 0;
+const heartbeatHandler = () => {
+  heartbeatCount++;
+  console.log(`心跳 #${heartbeatCount}`);
+};
+worker.onEvent('ping', heartbeatHandler);
+
+// 执行长时间任务，观察事件
+await worker.longTimeTask(2000);
+
+// 移除特定监听器
+unsubscribeProgress(); // 通过返回的函数移除
+worker.offEvent('ping', heartbeatHandler); // 通过 offEvent 移除
+
+// 清除所有事件监听器
+worker.clearEvents();
 ```
+
+## API 参考
+
+### 核心 API
+
+- `createTypedWorker<Actions, Events>(setupWorker)` - 创建类型安全的 Worker 实例
+- `defineWorkerActions(actions)` - 定义 Worker 操作
+- `setupWorkerActions(actions)` - 设置 Worker 操作
+- `defineWorkerSendEvent<Events>()` - 创建事件发送函数
+
+### Worker 实例方法
+
+- `call(actionName, transferableObjects?)` - 调用方法并支持 Transferable 对象
+- `terminate()` - 优雅关闭 Worker
+- `onEvent(eventName, listener)` - 监听事件
+- `offEvent(eventName, listener)` - 移除事件监听器
+- `clearEvents(eventName?)` - 清除事件监听器
